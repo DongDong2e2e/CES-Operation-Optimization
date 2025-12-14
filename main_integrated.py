@@ -10,14 +10,20 @@ import os
 
 # --- Configuration Constants ---
 # File Paths
-SMP_FILE = 'data/HOME_전력거래_계통한계가격_시간별 SMP.csv'
+SMP_FILE = 'data/smp_hourly.csv'
 PDM_FILE = 'data/ai4i2020.csv'
 OUTPUT_IMAGE_PATH = 'results/future_prediction_dashboard.png'
 
 # Market Model Parameters
-# yfinance 데이터 수집 문제로 Oil_Price와 Natural_Gas는 학습 피처에서 임시 제외
-MARKET_MODEL_FEATURES = ['Exchange_Rate', 'Month'] 
+# yfinance 데이터 수집 안정성을 위해 SPOT 전략 시에만 Natural_Gas를 동적으로 포함시킴
+MARKET_MODEL_FEATURES = ['Exchange_Rate', 'Month', 'Oil_Price', 'Natural_Gas'] 
 MARKET_MODEL_TARGET = 'SMP'
+
+# Business Scenario Parameters (사용자 시나리오 설정)
+LNG_PROCUREMENT_STRATEGY = 'FIXED' # 'FIXED': 지정된 고정 계약가, 'SPOT': yfinance 현물가 기반
+LNG_FIXED_CONTRACT_PRICE_USD = 10.5  # USD/MMBtu, 고정 계약 시 적용될 LNG 단가
+CARBON_CREDIT_PRICE_KRW_PER_TON = 22000 # KRW/tCO2, 탄소배출권 거래 가격
+EMISSION_FACTOR_TCO2_PER_MWH = 0.3789 # tCO2/MWh, LNG 발전의 탄소배출계수
 
 # Predictive Maintenance Model Parameters
 PDM_FEATURES = ['Air temperature [K]', 'Process temperature [K]', 'Rotational speed [rpm]', 'Torque [Nm]', 'Tool wear [min]']
@@ -177,34 +183,44 @@ def train_failure_model(pdm_path):
 
 def generate_future_predictions(market_model, machine_model, last_date, current_exchange_rate, current_oil_price, current_ng_price, user_input_state):
     """Generates a 30-day future scenario based on a user-defined current state."""
-    print("\n>>> 🔮 향후 30일 미래 예측 시뮬레이션 수행 중...")
+    print(f"\n>>> 🔮 향후 30일 미래 예측 시뮬레이션 수행 중 (전략: {LNG_PROCUREMENT_STRATEGY})...")
     future_dates = [last_date + timedelta(days=x) for x in range(1, FUTURE_DAYS_TO_PREDICT + 1)]
     df_future = pd.DataFrame({'Date': future_dates})
     
-    # --- Market Prediction ---
+    # --- 1. 미래 거시경제 지표 예측 ---
     df_future['Exchange_Rate'] = np.linspace(current_exchange_rate, current_exchange_rate + EXCHANGE_RATE_FUTURE_INCREASE, FUTURE_DAYS_TO_PREDICT)
     df_future['Oil_Price'] = np.linspace(current_oil_price, current_oil_price, FUTURE_DAYS_TO_PREDICT)
     df_future['Natural_Gas'] = np.linspace(current_ng_price, current_ng_price + NG_FUTURE_INCREASE, FUTURE_DAYS_TO_PREDICT)
     df_future['Month'] = df_future['Date'].dt.month
 
-    # 시장 모델 예측에 사용할 피처 필터링 (학습 피처와 동일하게)
+    # --- 2. 시장 가격(SMP) 예측 ---
     market_prediction_features = [col for col in MARKET_MODEL_FEATURES if col in df_future.columns]
     if not market_prediction_features:
         raise ValueError("미래 시장 가격 예측에 사용할 유효한 피처가 없습니다. MARKET_MODEL_FEATURES 설정을 확인하세요.")
         
     df_future['Predicted_SMP'] = market_model.predict(df_future[market_prediction_features])
     
-    # Improved LNG Price Formula using Natural Gas (with check for NaN)
-    if 'Natural_Gas' in df_future.columns and not df_future['Natural_Gas'].isnull().all():
-        df_future['Predicted_LNG'] = (df_future['Natural_Gas'] * 350) + (df_future['Exchange_Rate'] * 0.05)
-    else:
-        # 천연가스 데이터가 없으면 Oil_Price 기반으로 대체 (기존 단순화 공식)
-        df_future['Predicted_LNG'] = (df_future['Oil_Price'] * df_future['Exchange_Rate'] * 0.0012) + 20
-        print("경고: 천연가스 데이터가 없어 유가 기반 LNG 가격 공식을 사용합니다. 정확도가 낮을 수 있습니다.")
-
-    df_future['Predicted_Spread'] = df_future['Predicted_SMP'] - df_future['Predicted_LNG']
+    # --- 3. 발전 비용 및 수익 예측 (Logic Upgrade) ---
+    # 1MWh 전력 생산에 필요한 열량(MMBtu)과 변환 계수 (가정치)
+    MMBTU_PER_MWH = 5.88 # 1MWh 생산에 약 5.88 MMBtu 필요 (효율 58% 가정)
     
-    # --- Failure Prediction ---
+    # LNG 조달 전략에 따른 연료비 계산
+    if LNG_PROCUREMENT_STRATEGY == 'FIXED':
+        # 고정가 계약: (고정 USD 단가 * 환율 * MMBTU/MWh)
+        df_future['Fuel_Cost_per_MWh'] = LNG_FIXED_CONTRACT_PRICE_USD * df_future['Exchange_Rate'] * MMBTU_PER_MWH
+    elif LNG_PROCUREMENT_STRATEGY == 'SPOT':
+        # 현물가 계약: (현물 USD 단가 * 환율 * MMBTU/MWh)
+        df_future['Fuel_Cost_per_MWh'] = df_future['Natural_Gas'] * df_future['Exchange_Rate'] * MMBTU_PER_MWH
+    else:
+        raise ValueError(f"지원하지 않는 LNG 조달 전략입니다: {LNG_PROCUREMENT_STRATEGY}")
+        
+    # 탄소배출권 비용 계산 (KRW/MWh)
+    df_future['Carbon_Cost_per_MWh'] = EMISSION_FACTOR_TCO2_PER_MWH * CARBON_CREDIT_PRICE_KRW_PER_TON
+    
+    # 최종 발전 마진 계산 (Make or Buy 의사결정의 기준)
+    df_future['Predicted_Margin'] = df_future['Predicted_SMP'] - df_future['Fuel_Cost_per_MWh'] - df_future['Carbon_Cost_per_MWh']
+    
+    # --- 4. 설비 고장 확률 예측 ---
     initial_tool_wear = user_input_state['Tool wear [min]']
     df_future['Future_Tool_Wear'] = [initial_tool_wear + (d * TOOL_WEAR_RATE_PER_DAY) for d in range(FUTURE_DAYS_TO_PREDICT)]
     
@@ -226,9 +242,9 @@ def create_future_dashboard(df_future):
     
     plt.axvline(x=df_future['Date'].min(), color='black', linestyle='--', linewidth=1.5)
     
-    colors = [COLOR_PROFIT if x > 0 else COLOR_LOSS for x in df_future['Predicted_Spread']]
-    ax1.bar(df_future['Date'], df_future['Predicted_Spread'], color=colors, alpha=0.7, label='Forecasted Profit')
-    ax1.set_ylabel('Forecasted Spark Spread (KRW)', color='tab:blue', fontsize=12)
+    colors = [COLOR_PROFIT if x > 0 else COLOR_LOSS for x in df_future['Predicted_Margin']]
+    ax1.bar(df_future['Date'], df_future['Predicted_Margin'], color=colors, alpha=0.7, label='Forecasted Margin')
+    ax1.set_ylabel('Forecasted Margin (KRW/MWh)', color='tab:blue', fontsize=12)
     ax1.tick_params(axis='y', labelcolor='tab:blue')
     
     ax2 = ax1.twinx()
@@ -239,28 +255,32 @@ def create_future_dashboard(df_future):
     
     plt.text(df_future['Date'].min(), ax1.get_ylim()[1], '  Today (Prediction Start)', va='top')
     
-    recomm_days = df_future[df_future['Predicted_Spread'] < 0]
+    # 의사결정 기준을 Predicted_Margin으로 변경
+    recomm_days = df_future[df_future['Predicted_Margin'] < 0]
     
     title_text = PLOT_TITLE
     if not recomm_days.empty:
-        best_date = recomm_days['Date'].iloc[0]
-        ax2.annotate(f'Best Maintenance Date\n({best_date.strftime("%Y-%m-%d")})', 
-                     xy=(best_date, 0), xytext=(best_date, 50),
-                     arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=8),
-                     ha='center', fontsize=11, fontweight='bold', bbox=dict(boxstyle="round,pad=0.3", fc="yellow", ec="black", lw=1, alpha=0.8))
-        title_text += f'\n[Recommendation] Maintain on {best_date.strftime("%m-%d")} (Min Opportunity Cost)'
+        # 마진이 음수이면서 고장 확률이 임계값을 넘는 첫번째 날을 찾음
+        potential_dates = df_future[(df_future['Predicted_Margin'] < 0) & (df_future['Failure_Prob'] >= MAINTENANCE_RISK_THRESHOLD)]
+        if not potential_dates.empty:
+            best_date = potential_dates['Date'].iloc[0]
+            ax2.annotate(f'Best Maintenance Date\n({best_date.strftime("%Y-%m-%d")})', 
+                         xy=(best_date, 0), xytext=(best_date, 50),
+                         arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=8),
+                         ha='center', fontsize=11, fontweight='bold', bbox=dict(boxstyle="round,pad=0.3", fc="yellow", ec="black", lw=1, alpha=0.8))
+            title_text += f'\n[Recommendation] Maintain on {best_date.strftime("%m-%d")} (Lowest Opportunity Cost)'
     
     plt.title(title_text, fontsize=16, pad=20)
     
     if not os.path.exists('results'):
         os.makedirs('results')
     plt.savefig(OUTPUT_IMAGE_PATH)
-    print(f"완료! '{OUTPUT_IMAGE_PATH}'에 미래 예측 결과가 저장되었습니다.")
+    print(f"\n완료! '{OUTPUT_IMAGE_PATH}'에 미래 예측 대시보드가 저장되었습니다.")
 
 def generate_textual_report(df_future):
     """Generates a detailed textual report of the prediction results and recommendations."""
     print("\n" + "="*80)
-    print("                 ✨ 미래 30일 운전 및 정비 최적화 예측 보고서 ✨")
+    print(f"       ✨ 미래 30일 운전 및 정비 최적화 예측 보고서 (전략: {LNG_PROCUREMENT_STRATEGY}) ✨")
     print("="*80)
 
     forecast_start = df_future['Date'].min().strftime('%Y-%m-%d')
@@ -268,57 +288,57 @@ def generate_textual_report(df_future):
     print(f"\n▶️ 예측 기간: {forecast_start} 부터 {forecast_end} ({FUTURE_DAYS_TO_PREDICT}일간)")
     
     avg_smp = df_future['Predicted_SMP'].mean()
-    avg_lng = df_future['Predicted_LNG'].mean()
-    avg_spread = df_future['Predicted_Spread'].mean()
+    avg_fuel_cost = df_future['Fuel_Cost_per_MWh'].mean()
+    avg_carbon_cost = df_future['Carbon_Cost_per_MWh'].mean()
+    avg_margin = df_future['Predicted_Margin'].mean()
     max_risk = df_future['Failure_Prob'].max()
     max_risk_date = df_future.loc[df_future['Failure_Prob'].idxmax(), 'Date'].strftime('%Y-%m-%d')
 
-    print("\n--- 요약 ---")
-    print(f"  - 평균 예측 SMP: {avg_smp:.2f} KRW")
-    print(f"  - 평균 예측 LNG 가격: {avg_lng:.2f} KRW")
-    print(f"  - 평균 예측 수익성 (Spark Spread): {avg_spread:.2f} KRW")
-    print(f"  - 최대 설비 고장 위험: {max_risk:.2f}% (예상일: {max_risk_date})")
+    print("\n--- 요약 (비용 및 수익/MWh) ---")
+    print(f"  - 평균 예측 SMP (수익): {avg_smp:,.0f} KRW")
+    print(f"  - 평균 예측 연료비 (비용): {avg_fuel_cost:,.0f} KRW")
+    print(f"  - 평균 예측 탄소비 (비용): {avg_carbon_cost:,.0f} KRW")
+    print(f"  - 평균 예측 최종 마진 (수익-비용): {avg_margin:,.0f} KRW")
+    print(f"  - 최대 설비 고장 위험: {max_risk:.1f}% (예상일: {max_risk_date})")
 
-    print("\n--- 일자별 상세 예측 및 권고 ---")
-    print("날짜         | 예측 SMP | 예측 LNG | 예측 마진 | 고장 위험 | 비고")
-    print("-----------------------------------------------------------------------")
+    print("\n--- 일자별 상세 예측 및 권고 (단위: KRW/MWh) ---")
+    print("날짜         |  예측SMP |   연료비 |   탄소비 | 최종마진 | 위험(%) | 권고 사항")
+    print("------------------------------------------------------------------------------------------")
 
     recomm_count = 0
     for index, row in df_future.iterrows():
         date = row['Date'].strftime('%Y-%m-%d')
         smp = row['Predicted_SMP']
-        lng = row['Predicted_LNG']
-        spread = row['Predicted_Spread']
+        fuel = row['Fuel_Cost_per_MWh']
+        carbon = row['Carbon_Cost_per_MWh']
+        margin = row['Predicted_Margin']
         risk = row['Failure_Prob']
         notes = []
 
-        if pd.isna(spread) or pd.isna(lng): # NaN 값으로 인한 문제 방지
-            notes.append("데이터 부족 (LNG/마진 계산 불가)")
-        else:
-            if spread < 0:
-                notes.append("역마진 예상 (손실 구간)")
-            if risk >= MAINTENANCE_RISK_THRESHOLD:
-                notes.append(f"고위험 설비 상태 ({risk:.1f}%)")
-            
-            if spread < 0 and risk >= MAINTENANCE_RISK_THRESHOLD:
-                notes.append("-> 최적 정비 권고!")
-                recomm_count += 1
-            elif spread < 0 and risk < MAINTENANCE_RISK_THRESHOLD:
-                notes.append("-> 정비 고려 (저마진)")
+        if margin < 0:
+            notes.append("역마진 예상")
+        if risk >= MAINTENANCE_RISK_THRESHOLD:
+            notes.append(f"고위험({risk:.0f}%)")
+        
+        if margin < 0 and risk >= MAINTENANCE_RISK_THRESHOLD:
+            notes.append("-> 최적 정비일")
+            recomm_count += 1
+        elif margin < 0:
+            notes.append("-> 발전 중단 고려")
 
-        print(f"{date} | {smp:8.2f} | {lng:8.2f} | {spread:8.2f} | {risk:7.2f}% | {', '.join(notes)}")
+        note_str = ', '.join(notes) if notes else "발전 유지"
+        print(f"{date} | {smp:8,.0f} | {fuel:8,.0f} | {carbon:8,.0f} | {margin:8,.0f} | {risk:6.1f} | {note_str}")
 
     print("\n--- 종합 권고 ---")
-    if recomm_count > 0:
-        first_recomm_date = df_future[(df_future['Predicted_Spread'] < 0) & (df_future['Failure_Prob'] >= MAINTENANCE_RISK_THRESHOLD)]['Date'].min()
-        if pd.isna(first_recomm_date):
-            print("  - 현재 예측된 최적 정비 권고일은 없습니다.")
-        else:
-            print(f"  ✅ 예측된 최적 정비 시작일: {first_recomm_date.strftime('%Y-%m-%d')}")
-            print(f"     (마진이 낮고 고장 위험이 높은 기간을 활용한 기회비용 최소화 정비)")
+    potential_dates = df_future[(df_future['Predicted_Margin'] < 0) & (df_future['Failure_Prob'] >= MAINTENANCE_RISK_THRESHOLD)]
+    if not potential_dates.empty:
+        first_recomm_date = potential_dates['Date'].iloc[0]
+        print(f"  ✅ 예측된 최적 정비 시작일: {first_recomm_date.strftime('%Y-%m-%d')}")
+        print(f"     (자가발전 시 손실이 예상되고 고장 위험이 높은 기간을 활용하여 기회비용 최소화)")
     else:
-        print("  ❌ 현재 예측 기간 내에 특별히 정비를 권고할 만한 최적의 기간은 없습니다.")
-        print("     (마진이 낮고 고장 위험이 높은 기간이 겹치지 않음)")
+        print("  - 현재 예측 기간 내, 정비를 수행할 최적의 기간(역마진+고위험)은 발견되지 않았습니다.")
+        if not df_future[df_future['Predicted_Margin'] < 0].empty:
+            print("  - 단, 일부 역마진 구간이 존재하므로 해당일에는 수전(Buy)을 통한 조달을 권고합니다.")
     
     print("\n" + "="*80)
     print("보고서 생성 완료.")
