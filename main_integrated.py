@@ -139,6 +139,7 @@ def load_and_prepare_training_data(smp_path):
     df_smp = load_data_safe(smp_path)
     df_smp['기간'] = pd.to_datetime(df_smp['기간'], format='%Y/%m/%d').dt.tz_localize(None)
     df_smp_daily = df_smp.sort_values('기간')[['기간', '가중평균']].rename(columns={'기간':'Date', '가중평균':'SMP'})
+    df_smp_daily['SMP'] *= 1000 # Convert to MWh
     
     macro_start_date = df_smp_daily['Date'].min()
     macro_end_date = datetime.today()
